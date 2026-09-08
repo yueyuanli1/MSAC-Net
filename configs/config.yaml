@@ -1,0 +1,14 @@
+data_dir: "/data3/wangchangmiao/jiangxinjie/jxj_exp_try/data"
+imgMG_dir: "mg_nii/mg_images_nii"
+maskMG_dir: "mg_nii/mg_masks_nii"
+imgUS_dir: "us_nii/us_images_nii"
+maskUS_dir: "us_nii/us_masks_nii"
+clinical_dir: "configs/clinical.json"
+
+img_rows: 512
+img_cols: 512
+
+age_mean: 47.74
+age_std: 9.67
+diameter_mean: 31.56
+diameter_std: 19.38
