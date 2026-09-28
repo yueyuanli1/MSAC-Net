@@ -543,6 +543,9 @@ class MSHF(nn.Module):
         return backbone, feat_dim
 
     def load_weights(self, model, path):
+        if not os.path.exists(path):
+            print(f"Warning: pretrained weights not found: {path}. Using random initialization.")
+            return
         state_dict = torch.load(path, map_location='cpu')
         new_state_dict = {}
         for k, v in state_dict.items():

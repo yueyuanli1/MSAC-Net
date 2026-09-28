@@ -665,7 +665,7 @@ def save_reliability_analysis(
     }
 
 
-def compute_calibration_bin_gaps(logits, labels, bins=19):
+def compute_calibration_bin_gaps(logits, labels, bins=5):
     logits = torch.as_tensor(logits, dtype=torch.float32)
     labels = torch.as_tensor(labels, dtype=torch.long)
     probs = F.softmax(logits, dim=1)
@@ -678,7 +678,7 @@ def compute_calibration_bin_gaps(logits, labels, bins=19):
     avg_confidences = torch.zeros(bins, dtype=torch.float32)
     avg_accuracies = torch.zeros(bins, dtype=torch.float32)
     counts = torch.zeros(bins, dtype=torch.float32)
-    boundaries = torch.linspace(0, 1, bins + 1)
+    boundaries = torch.linspace(0.5, 1.0, bins + 1)
     for i, (lower, upper) in enumerate(zip(boundaries[:-1], boundaries[1:])):
         in_bin = confidences.gt(lower) & confidences.le(upper)
         if in_bin.any():
@@ -724,10 +724,10 @@ def summarize_gap_table(gap_table):
     }
 
 
-def save_calibration_gap_table(logits, labels, save_dir, prefix, bins=19):
+def save_calibration_gap_table(logits, labels, save_dir, prefix, bins=5):
     gap_table = compute_calibration_bin_gaps(logits, labels, bins=bins)
     csv_path = os.path.join(save_dir, f"{prefix}_calibration_bin_gap_table.csv")
-    boundaries = torch.linspace(0, 1, bins + 1)
+    boundaries = torch.linspace(0.5, 1.0, bins + 1)
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -783,7 +783,7 @@ def calibration_feedback_loss(
     logits,
     labels,
     gap_table,
-    bins=19,
+    bins=5,
     gap_weight=0.0,
     over_gap_weight=1.0,
     under_gap_weight=0.25,
@@ -798,7 +798,7 @@ def calibration_feedback_loss(
 
     losses = []
     if gap_weight > 0:
-        boundaries = torch.linspace(0, 1, bins + 1, device=logits.device)
+        boundaries = torch.linspace(0.5, 1.0, bins + 1, device=logits.device)
         bin_index = torch.bucketize(confidences.detach(), boundaries[1:-1], right=False).clamp(0, bins - 1)
         over_gaps = gap_table["over"].to(logits.device)[bin_index]
         under_gaps = gap_table["under"].to(logits.device)[bin_index]
@@ -1103,7 +1103,8 @@ def run_epoch(
     modalities,
     threshold_strategy="argmax",
     calibration_gap_table=None,
-    calibration_bins=19,
+    calibration_bins=15,
+    ccfm_bins=5,
     calibration_feedback_weight=0.0,
     over_gap_weight=1.0,
     under_gap_weight=0.25,
@@ -1159,7 +1160,7 @@ def run_epoch(
                         outputs,
                         labels,
                         calibration_gap_table,
-                        bins=calibration_bins,
+                        bins=ccfm_bins,
                         gap_weight=calibration_feedback_weight,
                         over_gap_weight=over_gap_weight,
                         under_gap_weight=under_gap_weight,
@@ -1217,30 +1218,116 @@ def run_epoch(
     return avg_loss, metrics, all_labels, final_preds, all_scores, threshold, all_logits
 
 
-def split_inner_train_calibration(train_info, seed):
-    """Split each fold's 80% training partition into 70% train and 10% calibration feedback."""
+def split_outer_train(train_info, seed):
+    """Split a fold's outer-train set (80% of the cohort) into parameter-train / calibration-feedback / internal-validation.
+
+    The outer-train set is divided 6:1:1 relative to the full cohort: 60% parameter-train
+    (gradient updates), 10% calibration-feedback (calibration loss) and 10% internal-validation
+    (best-epoch selection, LR schedule, early stopping and threshold determination). Relative to
+    the outer-train set itself this is 75% / 12.5% / 12.5%.
+    """
     labels = [info["label"] for info in train_info]
-    inner_train, inner_calib = train_test_split(
+
+    # 10% calibration-feedback set = 1/8 of the outer-train set.
+    param_val_info, calib_info = train_test_split(
         train_info,
         test_size=1 / 8,
         random_state=seed,
         stratify=labels,
     )
-    return inner_train, inner_calib
+
+    # 10% internal-validation set = 1/7 of the remaining 87.5%.
+    param_val_labels = [info["label"] for info in param_val_info]
+    param_train_info, internal_val_info = train_test_split(
+        param_val_info,
+        test_size=1 / 7,
+        random_state=seed + 1,
+        stratify=param_val_labels,
+    )
+
+    return param_train_info, calib_info, internal_val_info
 
 
-def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
+def evaluate_locked_test(
+    model,
+    test_loader,
+    criterion,
+    optimizer,
+    scaler,
+    device,
+    args,
+    fold_idx,
+    test_info,
+    locked_threshold,
+    selected_payload,
+):
+    """Evaluate the locked model on the outer-test set once, using the threshold fixed on internal validation."""
+    modalities = parse_modalities(args.modalities)
+    _, _, test_labels, test_preds_argmax, test_scores, _, test_logits, test_roi_cos = run_epoch(
+        model,
+        test_loader,
+        criterion,
+        optimizer,
+        scaler,
+        device,
+        args.use_seg,
+        False,
+        0,
+        0,
+        args.positive_label,
+        modalities,
+        threshold_strategy="argmax",
+        collect_consistency=True,
+    )
+
+    test_labels = np.asarray(test_labels, dtype=int)
+    test_scores = np.asarray(test_scores, dtype=float)
+    test_logits = np.asarray(test_logits, dtype=float)
+
+    if args.threshold_strategy == "youden" and np.isfinite(locked_threshold):
+        test_preds = predict_from_scores(test_scores, locked_threshold, positive_label=args.positive_label)
+    else:
+        test_preds = np.asarray(test_preds_argmax, dtype=int)
+
+    test_metrics = compute_binary_metrics(
+        test_labels,
+        test_preds,
+        test_scores,
+        positive_label=args.positive_label,
+        logits=test_logits,
+        calibration_bins=args.calibration_bins,
+    )
+
+    payload = dict(selected_payload)
+    payload.update(
+        {
+            "metrics": test_metrics,
+            "labels": test_labels,
+            "preds": test_preds,
+            "scores": test_scores,
+            "logits": test_logits,
+            "roi_cosine_similarity": np.asarray(test_roi_cos, dtype=float),
+            "patient_ids": np.asarray(
+                [get_patient_id(info, f"fold{fold_idx}_test{idx}") for idx, info in enumerate(test_info)]
+            ),
+        }
+    )
+    return payload
+
+
+def run_fold(fold_idx, train_info, test_info, args, root_save_dir, device):
     set_seed(args.seed + fold_idx)
     modalities = parse_modalities(args.modalities)
     fold_name = f"fold_{fold_idx}"
     fold_dir = os.path.join(root_save_dir, fold_name)
     os.makedirs(fold_dir, exist_ok=True)
 
-    inner_train_info, calib_info = split_inner_train_calibration(train_info, args.seed + fold_idx)
+    param_train_info, calib_info, internal_val_info = split_outer_train(train_info, args.seed + fold_idx)
 
-    train_dataset = MyDataset(inner_train_info, args.config_path, use_seg=args.use_seg, is_train=True)
+    train_dataset = MyDataset(param_train_info, args.config_path, use_seg=args.use_seg, is_train=True)
     calib_dataset = MyDataset(calib_info, args.config_path, use_seg=args.use_seg, is_train=False)
-    val_dataset = MyDataset(val_info, args.config_path, use_seg=args.use_seg, is_train=False)
+    val_dataset = MyDataset(internal_val_info, args.config_path, use_seg=args.use_seg, is_train=False)
+    test_dataset = MyDataset(test_info, args.config_path, use_seg=args.use_seg, is_train=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -1263,11 +1350,19 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
         num_workers=args.num_workers,
         pin_memory=True,
     )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
 
     print(f"Fold {fold_idx} outer train labels: {dict(sorted(Counter([x['label'] for x in train_info]).items()))}")
-    print(f"Fold {fold_idx} inner train labels: {dict(sorted(Counter([x['label'] for x in inner_train_info]).items()))}")
+    print(f"Fold {fold_idx} parameter-train labels: {dict(sorted(Counter([x['label'] for x in param_train_info]).items()))}")
     print(f"Fold {fold_idx} calibration-feedback labels: {dict(sorted(Counter([x['label'] for x in calib_info]).items()))}")
-    print(f"Fold {fold_idx} held-out val labels: {dict(sorted(Counter([x['label'] for x in val_info]).items()))}")
+    print(f"Fold {fold_idx} internal-validation labels: {dict(sorted(Counter([x['label'] for x in internal_val_info]).items()))}")
+    print(f"Fold {fold_idx} outer-test labels: {dict(sorted(Counter([x['label'] for x in test_info]).items()))}")
     print(f"Fold {fold_idx} use_seg={args.use_seg}")
     print(f"Fold {fold_idx} modalities={','.join(modalities)}")
     print(f"Fold {fold_idx} positive_label={args.positive_label} (0=Luminal, 1=non-Luminal)")
@@ -1277,7 +1372,7 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
 
     model = build_model(args, device)
     optimizer = build_optimizer(model, args)
-    criterion = build_criterion(inner_train_info, args, device)
+    criterion = build_criterion(param_train_info, args, device)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.5, patience=15, min_lr=1e-7
     )
@@ -1323,6 +1418,7 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
             args.positive_label, modalities, threshold_strategy="argmax",
             calibration_gap_table=calibration_gap_table,
             calibration_bins=args.calibration_bins,
+            ccfm_bins=args.ccfm_bins,
             calibration_feedback_weight=args.calibration_feedback_weight,
             over_gap_weight=args.over_gap_weight,
             under_gap_weight=args.under_gap_weight,
@@ -1351,7 +1447,7 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
         val_acc_auc_score = val_metrics["ACC"] + val_metrics["AUC"]
         monitor_score = get_monitor_score(val_metrics, args.monitor_metric)
         meets_save_constraints = is_valid_best_candidate(val_metrics, args)
-        current_gap_table = compute_calibration_bin_gaps(calib_logits, calib_labels, bins=args.calibration_bins)
+        current_gap_table = compute_calibration_bin_gaps(calib_logits, calib_labels, bins=args.ccfm_bins)
         calibration_gap_table = update_calibration_gap_table(
             calibration_gap_table,
             current_gap_table,
@@ -1428,7 +1524,7 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
             "scores": np.asarray(val_scores, dtype=float),
             "logits": np.asarray(val_logits, dtype=float),
             "roi_cosine_similarity": np.asarray(val_roi_cosine_similarity, dtype=float),
-            "patient_ids": np.asarray([get_patient_id(info, f"fold{fold_idx}_val{idx}") for idx, info in enumerate(val_info)]),
+            "patient_ids": np.asarray([get_patient_id(info, f"fold{fold_idx}_ival{idx}") for idx, info in enumerate(internal_val_info)]),
         }
 
         if monitor_score > fallback_score:
@@ -1462,8 +1558,8 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
 
             save_calibration_outputs(val_logits, val_labels, fold_dir, "best_val", bins=args.calibration_bins)
             save_calibration_outputs(calib_logits, calib_labels, fold_dir, "best_calibration_split", bins=args.calibration_bins)
-            save_calibration_gap_table(val_logits, val_labels, fold_dir, "best_val", bins=args.calibration_bins)
-            save_calibration_gap_table(calib_logits, calib_labels, fold_dir, "best_calibration_split", bins=args.calibration_bins)
+            save_calibration_gap_table(val_logits, val_labels, fold_dir, "best_val", bins=args.ccfm_bins)
+            save_calibration_gap_table(calib_logits, calib_labels, fold_dir, "best_calibration_split", bins=args.ccfm_bins)
             save_reliability_analysis(
                 val_labels,
                 val_logits,
@@ -1518,7 +1614,7 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
             best_payload["labels"],
             fold_dir,
             "best_val",
-            bins=args.calibration_bins,
+            bins=args.ccfm_bins,
         )
         save_reliability_analysis(
             best_payload["labels"],
@@ -1531,10 +1627,71 @@ def run_fold(fold_idx, train_info, val_info, args, root_save_dir, device):
             roi_cosine_similarity=best_payload.get("roi_cosine_similarity"),
         )
 
-    return best_payload
+    # Load the selected model and the threshold locked on internal validation, then evaluate the
+    # outer-test set exactly once. The outer-test set is not touched before this point: model
+    # selection, LR scheduling, early stopping and threshold determination all used the
+    # internal-validation set.
+    locked_threshold = best_payload["decision_threshold"]
+    model.load_state_dict(torch.load(os.path.join(fold_dir, "best_model.pth"), map_location=device))
+    model.eval()
+    test_payload = evaluate_locked_test(
+        model,
+        test_loader,
+        criterion,
+        optimizer,
+        scaler,
+        device,
+        args,
+        fold_idx,
+        test_info,
+        locked_threshold,
+        best_payload,
+    )
+
+    save_calibration_outputs(
+        test_payload["logits"],
+        test_payload["labels"],
+        fold_dir,
+        "test",
+        bins=args.calibration_bins,
+    )
+    save_calibration_gap_table(
+        test_payload["logits"],
+        test_payload["labels"],
+        fold_dir,
+        "test",
+        bins=args.ccfm_bins,
+    )
+    save_reliability_analysis(
+        test_payload["labels"],
+        test_payload["logits"],
+        fold_dir,
+        "test",
+        positive_label=args.positive_label,
+        patient_ids=test_payload["patient_ids"],
+        folds=np.full(len(test_payload["labels"]), fold_idx, dtype=int),
+        roi_cosine_similarity=test_payload["roi_cosine_similarity"],
+    )
+
+    with open(os.path.join(fold_dir, "test_metrics.txt"), "w") as f:
+        f.write(f"Fold {fold_idx} locked outer-test metrics (best epoch {best_payload['epoch']}):\n")
+        f.write(f"Positive label: {args.positive_label} (0=Luminal, 1=non-Luminal)\n")
+        f.write(f"Monitor metric: {args.monitor_metric}\n")
+        f.write(f"Threshold strategy: {best_payload['threshold_strategy']}\n")
+        f.write(f"Locked decision threshold: {locked_threshold:.8g}\n")
+        for metric in METRIC_NAMES:
+            f.write(f"{metric}: {test_payload['metrics'][metric]:.4f}\n")
+        f.write(f"BACC: {test_payload['metrics']['BACC']:.4f}\n")
+        f.write(f"GMEAN: {test_payload['metrics']['GMEAN']:.4f}\n")
+        f.write(f"TN: {test_payload['metrics']['TN']}\n")
+        f.write(f"FP: {test_payload['metrics']['FP']}\n")
+        f.write(f"FN: {test_payload['metrics']['FN']}\n")
+        f.write(f"TP: {test_payload['metrics']['TP']}\n")
+
+    return test_payload
 
 
-def write_fold_outputs(best_payloads, save_dir, positive_label, calibration_bins=19):
+def write_fold_outputs(best_payloads, save_dir, positive_label, calibration_bins=15, ccfm_bins=5):
     fold_metrics_path = os.path.join(save_dir, "fold_metrics.csv")
     with open(fold_metrics_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -1640,7 +1797,7 @@ def write_fold_outputs(best_payloads, save_dir, positive_label, calibration_bins
     )
     save_mean_fold_roc(best_payloads, summary, save_dir, prefix="mean_fold", positive_label=positive_label)
     save_calibration_outputs(logits, labels, save_dir, "pooled_oof", bins=calibration_bins)
-    save_calibration_gap_table(logits, labels, save_dir, "pooled_oof", bins=calibration_bins)
+    save_calibration_gap_table(logits, labels, save_dir, "pooled_oof", bins=ccfm_bins)
     save_reliability_analysis(
         labels,
         logits,
@@ -1677,7 +1834,8 @@ def train_kfold(args):
         f"momentum={args.calibration_gap_momentum}, "
         f"over_gap_weight={args.over_gap_weight}, "
         f"under_gap_weight={args.under_gap_weight}, "
-        f"overconfidence_threshold={args.overconfidence_threshold}"
+        f"overconfidence_threshold={args.overconfidence_threshold}, "
+        f"ccfm_bins={args.ccfm_bins}, ece_bins={args.calibration_bins}"
     )
 
     start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1689,10 +1847,10 @@ def train_kfold(args):
     skf = StratifiedKFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
     best_payloads = []
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels), start=1):
+    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(np.zeros(len(labels)), labels), start=1):
         train_info = [infos[i] for i in train_idx]
-        val_info = [infos[i] for i in val_idx]
-        best_payload = run_fold(fold_idx, train_info, val_info, args, save_dir, device)
+        test_info = [infos[i] for i in test_idx]
+        best_payload = run_fold(fold_idx, train_info, test_info, args, save_dir, device)
         best_payloads.append(best_payload)
 
     write_fold_outputs(
@@ -1700,6 +1858,7 @@ def train_kfold(args):
         save_dir,
         positive_label=args.positive_label,
         calibration_bins=args.calibration_bins,
+        ccfm_bins=args.ccfm_bins,
     )
     print(f"K-fold training complete: {save_dir}")
 
@@ -1709,7 +1868,7 @@ def parse_args():
     parser.add_argument("--config_path", type=str, default="configs/config.yaml")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num_epochs", type=int, default=30)
+    parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--model", type=str, default="MSHF", choices=["MSHF", "MSHF_ViT"])
     parser.add_argument("--backbone", type=str, default="ResNet50", choices=["ResNet50", "DenseNet121", "InceptionV3", "VGG16", "ViT-B_16"])
     parser.add_argument("--num_classes", type=int, default=2)
@@ -1730,11 +1889,12 @@ def parse_args():
     parser.add_argument("--use_seg", action="store_true")
     parser.add_argument("--loss_type", type=str, default="ce", choices=["cb_focal", "ce"])
     parser.add_argument("--modalities", type=str, default="mg,us,clinical", help="Comma-separated enabled modalities: mg,us,clinical. Examples: mg; us; mg,us; mg,clinical; us,clinical.")
-    parser.add_argument("--experiment_name", type=str, default="ABLATION_NoSegGuidance_CrossEntropyLoss_CALIBRATION_FEEDBACK_70_10_20")
+    parser.add_argument("--experiment_name", type=str, default="ABLATION_NoSegGuidance_CrossEntropyLoss_CALIBRATION_FEEDBACK_60_10_10_20")
     parser.add_argument("--cb_beta", type=float, default=0.99)
     parser.add_argument("--focal_gamma", type=float, default=1.5)
     parser.add_argument("--label_smoothing", type=float, default=0.02)
-    parser.add_argument("--calibration_bins", type=int, default=19, help="Number of confidence bins for validation calibration reporting.")
+    parser.add_argument("--calibration_bins", type=int, default=15, help="Number of confidence bins (over [0,1]) for ECE/MCE reporting.")
+    parser.add_argument("--ccfm_bins", type=int, default=5, help="Number of equal-width confidence bins (over [0.5,1]) for the CCFM gap table and calibration feedback loss.")
     parser.add_argument("--calibration_feedback_weight", type=float, default=0.05, help="Weight for calibration-gap feedback loss from the previous calibration-feedback split epoch.")
     parser.add_argument("--overconfidence_weight", type=float, default=0.05, help="Weight for penalizing high-confidence wrong predictions during training.")
     parser.add_argument("--over_gap_weight", type=float, default=1.0, help="Weight for overconfidence bin gap inside calibration feedback.")
