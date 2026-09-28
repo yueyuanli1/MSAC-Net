@@ -63,10 +63,9 @@ US          ─┤── 骨干网络(ResNet-50) ──┐
 
 | 集合 | 比例 | 用途 |
 |---|---|---|
-| 外层训练集 | 80% | — |
-| ├ 参数训练集 | 60% | 梯度更新（反向传播） |
-| ├ 校准反馈集 | 10% | 计算校准间隙与校准损失（**不参与梯度更新**） |
-| └ 内部验证集 | 10% | 选择最佳 epoch、调整学习率、早停、确定分类阈值 |
+| 参数训练集 | 60% | 梯度更新（反向传播） |
+| 校准反馈集 | 10% | 计算校准间隙与校准损失（**不参与梯度更新**） |
+| 内部验证集 | 10% | 选择最佳 epoch、调整学习率、早停、确定分类阈值 |
 | 外层测试集 | 20%（约 80 例） | **仅在模型、超参数和阈值锁定后**做该折的最终评价 |
 
 **关键约束**：外层测试集在模型、超参数和阈值锁定前**不得访问**。
@@ -238,4 +237,6 @@ MSAC-Net-main/
 
 ## 致谢（Acknowledgement）
 
-本项目受浙江省自然科学基金（No. LY21F020017）、国家自然科学基金（No. 61702146, 62076084, U22A2033, U20A20386）等项目资助。
+This work was supported by the Zhejiang Provincial Natural Science Foundation of China (No. LY21F020017), the Guangxi Science and Technology Program (No. FN2504240022), the National Natural Science Foundation of China (No. 61702146, 62076084, U22A2033, U20A20386), the Guangxi Key R&D Project (No. AB24010167), and the Guangdong Basic and Applied Basic Research Foundation (No. 2025A1515011617).
+
+（本项目受浙江省自然科学基金 No. LY21F020017、广西科技计划项目 No. FN2504240022、国家自然科学基金 No. 61702146/62076084/U22A2033/U20A20386、广西重点研发计划项目 No. AB24010167、广东省基础与应用基础研究基金 No. 2025A1515011617 资助。）
